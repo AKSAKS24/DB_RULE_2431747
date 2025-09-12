@@ -10,7 +10,6 @@ app = FastAPI(
 # Table mapping & config
 TABLE_MAPPING = {
     "BSIS": {"source": "ACDOCA", "view": True},
-    "BSEG": {"source": "ACDOCA", "view": True},
     "BSAS": {"source": "ACDOCA", "view": True},
     "BSIK": {"source": "ACDOCA", "view": True},
     "BSAK": {"source": "ACDOCA", "view": True},
@@ -25,13 +24,6 @@ TABLE_MAPPING = {
     "ANLP": {"source": "ACDOCA", "view": True},
 }
 NO_VIEW_TABLES = {"FAGLFLEXA", "FAGLFLEXT"}
-
-OBSOLETE_TABLES = set(TABLE_MAPPING.keys()) | set(NO_VIEW_TABLES)
-
-# Regex for matching obsolete table literals
-LITERAL_TABLES_RE = re.compile(
-    r"\b(" + "|".join(re.escape(t) for t in OBSOLETE_TABLES) + r")\b", re.IGNORECASE
-)
 
 # Models for input/output (payload and response)
 class Finding(BaseModel):
@@ -150,7 +142,7 @@ def scan_unit(unit: Unit) -> dict:
     findings: List[Dict] = []
     src = unit.code or ""
 
-    # 1. SELECT single-table
+    # SELECT
     for m in SELECT_RE.finditer(src):
         table = m.group("table")
         t_up = (table or "").upper()
@@ -167,7 +159,7 @@ def scan_unit(unit: Unit) -> dict:
             findings.append(pack_issue(unit, "ObsoleteTableSelect", msg, sev,
                                       m.start(), m.end(), suggestion, meta))
 
-    # 2. UPDATE, DELETE, INSERT, MODIFY
+    # UPDATE, DELETE, INSERT, MODIFY
     for stmt_type, pattern in [
         ("UPDATE", UPDATE_RE),
         ("DELETE", DELETE_RE),
@@ -194,53 +186,7 @@ def scan_unit(unit: Unit) -> dict:
                     findings.append(pack_issue(unit, f"ObsoleteTable{stmt_type.title()}", msg, sev,
                                               m.start(1), m.end(1), suggestion, meta))
 
-    # --- FIND OBSELETE TABLE IN ANY JOIN (INCLUDING MULTI-TABLE SELECTS) ---
-    # For every SELECT ... FROM ... [JOIN ...], find each JOIN <table>
-    for select_match in re.finditer(r"SELECT[\s\S]*?FROM\s+\w+[\s\S]*?\.", src, re.IGNORECASE):
-        block = select_match.group(0)
-        block_start = select_match.start()
-        for join in re.finditer(r"\bJOIN\s+(\w+)\b", block, re.IGNORECASE):
-            table = join.group(1)
-            t_up = table.upper()
-            if t_up in TABLE_MAPPING or t_up in NO_VIEW_TABLES:
-                suggestion = (remediation_comment(table, "SELECT") + 
-                             f" Replace '{table}' in JOIN with '{get_replacement_table(table)}'.")
-                findings.append(pack_issue(
-                    unit, "ObsoleteTableJoin", f"JOIN on obsolete table/view {t_up}.", "warning",
-                    block_start + join.start(1), block_start + join.end(1),
-                    suggestion, {
-                        "orig_table": table,
-                        "replacement_table": get_replacement_table(table),
-                        "context": "JOIN"
-                    }
-                ))
-    
-    # --- FIND LITERAL USAGE OF OBSOLETE TABLES ANYWHERE ---
-    # This includes: string literals, variable assignment, etc.
-    # To avoid duplicate reports, filter out those already found in statements (optional/deduplication can be added)
-    literal_regions = set()
-    # mark regions already found by statement or join finding
-    for finding in findings:
-        literal_regions.add((finding.get('start_line'), finding.get('line'), finding.get('snippet')))
-    
-    for m in LITERAL_TABLES_RE.finditer(src):
-        table = m.group(1)
-        t_up = table.upper()
-        # Deduplication: skip if location is inside a region we've already flagged
-        snippet = snippet_at(src, m.start(), m.end())
-        check_key = (line_of_offset(src, m.start()), line_of_offset(src, m.end()), snippet)
-        if check_key in literal_regions:
-            continue
-        suggestion = f"Replace literal '{table}' with '{get_replacement_table(table)}' where applicable."
-        findings.append(pack_issue(
-            unit, "ObsoleteTableLiteral", f"Obsolete table/view {t_up} used as a literal.", "info",
-            m.start(), m.end(), suggestion, {
-                "orig_table": table,
-                "replacement_table": get_replacement_table(table),
-                "context": "literal"
-            }
-        ))
-
+    # Add findings field to the result for this unit (in same style as system code)
     res = unit.model_dump()
     res["findings"] = findings
     return res
